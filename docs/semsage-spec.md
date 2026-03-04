@@ -1,333 +1,349 @@
-# Streams vs KV Watches
+# Semsage Architectural Specification
 
-How to choose between JetStream streams and KV watches, and why agentic and workflow components use both.
+Semsage exposes SemStreams' existing agentic capabilities through a clean tool interface. It is a separate Go module (`github.com/c360studio/semsage`) that imports SemStreams as a dependency. SemStreams never imports Semsage.
 
-## The Heuristic
+## Origin
 
-SemStreams uses two NATS communication primitives for internal coordination. The choice between them
-is not arbitrary — each maps to a fundamentally different kind of communication.
+Semsage is inspired by the [OpenSage whitepaper](https://arxiv.org/abs/2602.16891) ("Self-Programming Agent Generation Engine" by Li et al.) and [Ian Blenke's SageAgent](https://github.com/ianblenke/sageagent) — an open-source Python implementation of those concepts. SageAgent implements self-generated topology (LLM-driven DAG decomposition), dynamic tool creation, hierarchical graph-based memory, and agent coordination via a pub/sub message bus.
 
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                        The Decision                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   "Is this a fact about the world                                   │
-│    or a request to do something?"                                   │
-│                                                                      │
-│   Fact about the world  ──────────────────► KV Watch (twofer)      │
-│   Request to do something ────────────────► JetStream Stream        │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The realization: SemStreams already provides all of these capabilities natively — with better persistence (NATS JetStream), better type safety (Go + typed payloads), and a governance model (filter chain at processor boundary). SageAgent built custom memory graph, message bus, tool registry, and topology manager in Python to approximate what SemStreams already has.
 
-A drone's battery level is a fact. "Call this LLM with these messages" is a request. "This sensor
-updated" is a fact. "Execute this tool" is a request. The distinction is usually obvious, and it
-drives the right technical choice automatically.
+## Core Principle
 
-## Why the Distinction Matters
+**Agents are just another consumer of SemStreams flows.** No new framework, no DSL.
 
-The two primitives have fundamentally different restart semantics, and restart behavior reveals what
-each one is actually for.
+- Tools are flows — processors wired as reactive definitions
+- `spawn_agent` composes flows by instantiating child loops
+- `decompose_task` produces a DAG of flows to instantiate
+- The knowledge graph is shared state everything reads/writes
+- Reactive definitions ARE the execution model
+- The governance filter chain sits at the processor boundary, covering everything automatically
 
-### KV Watch on Restart
+Every Semsage capability is a `ToolExecutor` or a `reactive.Definition`. No new extension mechanisms — it plugs into existing SemStreams contracts.
 
-When a KV-watching processor restarts, it receives all current values matching its watch pattern
-before processing any new changes. This is the bootstrap phase from [the KV Twofer doc](https://github.com/C360Studio/semstreams/blob/main/docs/concepts/02-kv-twofer.md).
+## SemStreams Contracts
 
-```text
-graph-index restarts:
-
-  ENTITY_STATES delivers all current entities (bootstrap)
-       │
-       ├── entity A (revision 47)
-       ├── entity B (revision 12)
-       └── entity C (revision 103)
-       │
-       nil  ◄── bootstrap complete
-       │
-       ├── entity D (new, live)
-       └── entity A updated (live)
-```
-
-This is correct behavior for a processor that maintains derived state. `graph-index` needs to
-re-index everything it can see to ensure its output buckets are consistent with `ENTITY_STATES`.
-Replaying is not a bug — it's recovery.
-
-### JetStream Consumer on Restart
-
-When a JetStream consumer restarts with `DeliverPolicy: "new"`, it picks up from where it left off
-in the stream, processing only messages that arrived after it last acked. Messages it already
-processed stay processed.
-
-```text
-agentic-loop restarts (DeliverPolicy: "new", durable consumer):
-
-  AGENT stream has messages at seq 1..50
-  Consumer last acked seq 43
-
-  On restart: delivers seq 44, 45, 46... (in-flight messages only)
-  Does NOT replay: seq 1-43 (already handled)
-```
-
-This is correct behavior for a work queue. An LLM task that was already dispatched should not be
-re-dispatched because the orchestrator restarted. Replaying would mean double-executing work with
-real cost and side effects.
-
-**The restart test:** If replaying every message since the beginning of time would be correct and
-harmless, use KV watch. If it would be catastrophic, use a JetStream stream.
-
----
-
-## The Two Dimensions
-
-The restart question is the sharpest test, but two other dimensions reinforce it:
-
-### Dimension 1: Fan-out vs. Queue
-
-```text
-KV Watch — Fan-out:                    JetStream — Queue:
-
-  ENTITY_STATES write                    AGENT stream message
-       │                                       │
-       ├──► graph-index (watches)              │ (one consumer gets it)
-       ├──► graph-rules (watches)              ▼
-       ├──► graph-embedding (watches)    agentic-loop-instance-A
-       └──► graph-clustering (watches)
-```
-
-KV watches are naturally fan-out: every watcher sees every change. This is correct for derived
-state — multiple indexes should all update when an entity changes.
-
-JetStream consumers in a queue group are naturally competing: only one consumer instance handles
-each message. This is correct for work items — only one loop orchestrator should execute a given
-task.
-
-### Dimension 2: Processing Time
-
-```text
-KV Watch:                              JetStream:
-
-  Entity state change arrives            Task message arrives
-       │                                       │
-  Process in microseconds                Process over minutes
-  (indexing, rule eval)                  (LLM calls, tool execution)
-       │                                       │
-  No ack needed                         AckWait, InProgress heartbeats,
-  Idempotent on retry                   MaxDeliver, BackOff all apply
-```
-
-KV watches have no ack mechanism — they're fire-and-react. This is fine for fast, idempotent
-processing. If the processor crashes mid-update, it will recover the correct current state on
-restart from the next watch delivery or bootstrap.
-
-JetStream consumers with explicit ack give you the full tuning surface from the
-[JetStream Tuning Guide](https://github.com/C360Studio/semstreams/blob/main/docs/advanced/11-jetstream-tuning.md): `AckWait` for deadline enforcement,
-`InProgress` heartbeats for long operations, `BackOff` for graduated retry, `MaxAckPending`
-for backpressure. These tools exist precisely because work items have variable, potentially
-long processing times and real consequences for failure.
-
----
-
-## How Agentic Components Use Both
-
-The agentic components use both primitives correctly — streams for work items, KV for state — and
-seeing them side-by-side makes the distinction concrete.
-
-```text
-┌───────────────────────────────────────────────────────────────────┐
-│                    Agentic Component Architecture                  │
-├───────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│  Work items (JetStream streams):                                  │
-│                                                                    │
-│   agent.task.*      ──► agentic-loop    "Execute this task"       │
-│   agent.request.*   ──► agentic-model   "Call LLM with these msgs"│
-│   tool.execute.*    ──► agentic-tools   "Run this tool"           │
-│   tool.result.*     ──► agentic-loop    "Here's the tool output"  │
-│   agent.response.*  ──► agentic-loop    "Here's the LLM output"   │
-│                                                                    │
-│  State (KV buckets — twofer):                                     │
-│                                                                    │
-│   AGENT_LOOPS        "What state is loop X in?"                   │
-│   AGENT_TRAJECTORIES "What did loop X do, step by step?"         │
-│                                                                    │
-│  Derived graph state (KV buckets — twofer):                       │
-│                                                                    │
-│   ENTITY_STATES      "What do we know about agent X's loop?"     │
-│   PREDICATE_INDEX    "Which loops are in 'executing' state?"      │
-│                                                                    │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-### Why task dispatch uses streams
-
-`agent.task.*` carries an instruction to do expensive work. If the agentic-loop component
-restarted, you do not want it to re-execute every task it has ever received. You want it to
-resume only the tasks that were in flight at the time of the crash.
-
-`DeliverPolicy: "new"` on a durable consumer achieves exactly this: the consumer position
-is persisted, and on restart it picks up from the last acked message.
-
-If the system were to use a KV watch for task dispatch instead, every restart would re-trigger
-every task ever queued. That would be catastrophic — re-running LLM tasks, re-executing tools
-with side effects, producing duplicate results.
-
-### Why loop state uses KV
-
-`AGENT_LOOPS` stores the current state of each loop entity: which phase it's in, how many
-iterations it has run, which tool calls are pending. This is a fact about the world, not a
-request to do anything.
-
-Any component that needs to know a loop's current state can call `kv.Get()`. Any component
-that wants to react when a loop enters a specific phase can call `kv.Watch()`. When the
-agentic-loop component restarts, it can recover the full current state of all active loops
-from the bucket — no replay of task messages needed.
-
-If loop state were published to a JetStream stream instead, it would not be queryable by
-other components without consuming and replaying the stream. The stream would grow without
-bound. And the latest-value semantics of KV (which is all you usually need — "what state is
-this loop in right now?") would require extra work to reconstruct.
-
-### Why tool results use streams
-
-`tool.result.*` carries the output of a specific tool call back to the orchestrating loop.
-This is a work item response — it is only meaningful to the specific loop instance that
-issued the tool call, and it should be delivered exactly once.
-
-A KV approach would require the loop to poll or watch a known key for its result. Streams
-deliver the result push-style to the consumer that is waiting for it, with at-least-once
-guarantees and explicit ack. The stream also acts as a buffer — if the agentic-loop is
-processing a previous result when a tool finishes, the result waits in the stream rather
-than being dropped.
-
----
-
-## The Workflow Processor
-
-The same logic applies to the workflow processor, and it's worth being explicit because
-workflows have a mix of triggers (streams) and state (KV) in close proximity.
-
-```text
-Workflow trigger:   workflow.trigger.{workflow_id}  ← JetStream stream
-                         │
-                         │  "Execute this workflow with these inputs"
-                         │  (a request to do something)
-                         ▼
-                    workflow-processor
-
-Execution state:    WORKFLOW_EXECUTIONS KV           ← KV twofer
-                         │
-                         │  "What step is execution X on?"
-                         │  (a fact about the world)
-                         │
-                         ├── readable by anything
-                         ├── watchable for status updates
-                         └── recoverable after restart
-```
-
-The trigger is a stream message because "start this workflow" is a request with real cost —
-you don't want it replayed on restart. The execution state is KV because "what step is this
-execution on" is a fact that should be readable and recoverable.
-
-Timer state follows the same pattern. `WORKFLOW_TIMERS` is KV because it records when timers
-are scheduled to fire — a fact. The timer fire event itself (`workflow.timer.fire`) is a
-stream message because "fire this timer now" is a request that should happen exactly once.
-
----
-
-## Decision Guide
-
-Apply these tests in order. The first test that gives a clear answer is usually sufficient.
-
-```text
-1. Restart test
-   ─────────────
-   If this processor restarted, should it re-process messages it already handled?
-
-   Yes (re-process is correct recovery) ──────────────► KV Watch
-   No (re-process would be wrong)  ───────────────────► JetStream Stream
-
-
-2. Fan-out vs. queue test
-   ───────────────────────
-   Should multiple processors all react to this, or should only one handle it?
-
-   All react (fan-out)  ───────────────────────────────► KV Watch
-   Only one handles it (queue)  ───────────────────────► JetStream Stream
-
-
-3. Processing time test
-   ─────────────────────
-   Is the processing fast and idempotent, or slow with real side effects?
-
-   Fast and idempotent  ───────────────────────────────► KV Watch
-   Slow or has side effects  ──────────────────────────► JetStream Stream
-
-
-4. Nature test
-   ────────────
-   Is this a fact about the world, or a request to do something?
-
-   Fact  ─────────────────────────────────────────────► KV Watch
-   Request  ──────────────────────────────────────────► JetStream Stream
-```
-
-If any test gives conflicting answers, that is a signal the design may be muddled — revisit
-whether the concept is actually a single thing or two things conflated.
-
-### Common Cases
-
-| Communication | Right primitive | Reason |
-|--------------|-----------------|--------|
-| Entity state changed | KV Watch | Fact; fan-out; fast; idempotent |
-| New task to execute | JetStream Stream | Request; queue; expensive; side effects |
-| Index update | KV Write → others watch | Fact; fan-out; fast |
-| LLM call | JetStream Stream | Request; queue; slow; costly |
-| Loop current state | KV | Fact; queryable; recoverable |
-| Tool execution request | JetStream Stream | Request; queue; has side effects |
-| Workflow trigger | JetStream Stream | Request; queue; expensive |
-| Workflow execution state | KV | Fact; queryable; recoverable |
-| Completion notification | JetStream Stream | Request (to downstream); once |
-| Sensor telemetry | KV Write → ENTITY_STATES | Fact; latest-value semantics |
-
----
-
-## What This Looks Like in Code
-
-A component using both primitives in the same process is completely normal. The agentic-loop
-does exactly this — it has JetStream consumers for work item inputs and KV bucket handles for
-state:
+### ToolExecutor Interface
 
 ```go
-type AgenticLoop struct {
-    // Work item channels (JetStream)
-    taskConsumer     jetstream.ConsumeContext  // agent.task.* — inbound work
-    responseConsumer jetstream.ConsumeContext  // agent.response.* — LLM results
-    resultConsumer   jetstream.ConsumeContext  // tool.result.* — tool results
-
-    // State (KV twofer)
-    loopsBucket       nats.KeyValue  // AGENT_LOOPS — current loop state
-    trajectoriesBucket nats.KeyValue // AGENT_TRAJECTORIES — execution trace
-
-    // Outbound work (JetStream publish)
-    js jetstream.JetStream  // publish to agent.request.*, tool.execute.*
+// semstreams/processor/agentic-tools/executor.go
+type ToolExecutor interface {
+    Execute(ctx context.Context, call agentic.ToolCall) (agentic.ToolResult, error)
+    ListTools() []agentic.ToolDefinition
 }
 ```
 
-The separation is visible in the type signatures: `jetstream.ConsumeContext` for work item
-inputs, `nats.KeyValue` for state. The distinction is structural, not just conceptual.
+Registration via `ExecutorRegistry`:
 
----
+```go
+// semstreams/processor/agentic-tools/global.go
+func RegisterTool(name string, executor ToolExecutor) error
+func GetGlobalRegistry() *ExecutorRegistry
+```
 
-## Related
+### Tool Types
 
-**This document builds on:**
-- [The KV Twofer](https://github.com/C360Studio/semstreams/blob/main/docs/concepts/02-kv-twofer.md) — KV watch mechanics, bootstrap phase, predicate channels
+```go
+// semstreams/agentic/tools.go
+type ToolDefinition struct {
+    Name        string         `json:"name"`
+    Description string         `json:"description"`
+    Parameters  map[string]any `json:"parameters"`
+}
 
-**Context:**
-- [JetStream Tuning Guide](https://github.com/C360Studio/semstreams/blob/main/docs/advanced/11-jetstream-tuning.md) — AckWait, InProgress, MaxAckPending
-  for the JetStream side of this pattern
-- [Agentic Components Reference](https://github.com/C360Studio/semstreams/blob/main/docs/advanced/08-agentic-components.md) — full port and
-  configuration details for agentic-loop, agentic-model, agentic-tools
-- [Event-Driven Basics](https://github.com/C360Studio/semstreams/blob/main/docs/concepts/01-event-driven-basics.md) — JetStream and KV fundamentals
+type ToolCall struct {
+    ID        string         `json:"id"`
+    Name      string         `json:"name"`
+    Arguments map[string]any `json:"arguments,omitempty"`
+    Metadata  map[string]any `json:"metadata,omitempty"`
+    LoopID    string         `json:"loop_id,omitempty"`
+    TraceID   string         `json:"trace_id,omitempty"`
+}
+
+type ToolResult struct {
+    CallID   string         `json:"call_id"`
+    Content  string         `json:"content,omitempty"`
+    Error    string         `json:"error,omitempty"`
+    Metadata map[string]any `json:"metadata,omitempty"`
+    LoopID   string         `json:"loop_id,omitempty"`
+    TraceID  string         `json:"trace_id,omitempty"`
+}
+```
+
+### TaskMessage
+
+```go
+// semstreams/agentic/user_types.go (key fields)
+type TaskMessage struct {
+    LoopID       string                   `json:"loop_id,omitempty"`
+    TaskID       string                   `json:"task_id"`       // required
+    Role         string                   `json:"role"`          // required
+    Model        string                   `json:"model"`         // required
+    Prompt       string                   `json:"prompt"`        // required
+    ParentLoopID string                   `json:"parent_loop_id,omitempty"`
+    Depth        int                      `json:"depth,omitempty"`
+    MaxDepth     int                      `json:"max_depth,omitempty"`
+    Context      *types.ConstructedContext `json:"context,omitempty"`
+    Tools        []ToolDefinition         `json:"tools,omitempty"`
+    Metadata     map[string]any           `json:"metadata,omitempty"`
+}
+```
+
+### Loop Events
+
+```go
+// semstreams/agentic/events.go
+type LoopCompletedEvent struct {
+    LoopID       string    `json:"loop_id"`
+    TaskID       string    `json:"task_id"`
+    Outcome      string    `json:"outcome"` // "success"
+    Result       string    `json:"result"`
+    ParentLoopID string    `json:"parent_loop,omitempty"`
+    CompletedAt  time.Time `json:"completed_at"`
+    // ... plus Role, Model, Iterations, token counts, routing fields
+}
+
+type LoopFailedEvent struct {
+    LoopID   string    `json:"loop_id"`
+    TaskID   string    `json:"task_id"`
+    Outcome  string    `json:"outcome"` // "failed"
+    Reason   string    `json:"reason"`
+    Error    string    `json:"error"`
+    FailedAt time.Time `json:"failed_at"`
+    // ... plus Role, Model, Iterations, token counts, routing fields
+}
+```
+
+### reactive.Definition
+
+```go
+// semstreams/processor/reactive/types.go
+type Definition struct {
+    ID            string
+    Description   string
+    StateBucket   string
+    StateFactory  func() any
+    MaxIterations int
+    Timeout       time.Duration
+    Rules         []RuleDef
+    Events        EventConfig
+}
+```
+
+Used for Phase 2 DAG execution workflow.
+
+## Tool Specifications
+
+### spawn_agent
+
+Publishes a `TaskMessage` to create a child agentic-loop. Blocks until the child completes, times out, or fails. Returns the child's result as a normal `ToolResult`.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | string | yes | Task prompt for the child agent |
+| `role` | string | yes | System role for the child agent |
+| `model` | string | no | LLM model (defaults to parent's model) |
+| `tools` | array | no | Tool subset for the child (defaults to parent's tools) |
+| `timeout` | string | no | Duration string (defaults to "5m") |
+| `metadata` | object | no | Additional context passed to child |
+
+**Implementation contract:**
+
+1. Subscribe to `agent.complete.{childLoopID}` BEFORE publishing (no race)
+2. Build `TaskMessage` with `ParentLoopID` from `call.LoopID`, enforce `Depth < MaxDepth`
+3. Create graph entity for child loop + `agentic.loop.spawned` relationship triple
+4. Publish to `agent.task.{childLoopID}`
+5. Block on: completion channel, `ctx.Done()`, timeout
+6. Return child's `Result` as `ToolResult.Content`, or error `ToolResult` on failure
+7. Unsubscribe on all exit paths (defer)
+
+**Concurrency:** The existing agentic-loop already handles parallel tool calls. If the LLM emits three `spawn_agent` calls in one response, three children run concurrently for free.
+
+### create_tool
+
+Lets the LLM compose existing processors into named reactive definitions at runtime. Instead of a code sandbox, `create_tool` wires existing pieces — not writing new code.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Tool name (must be unique within agent tree) |
+| `description` | string | yes | Human-readable description |
+| `processors` | array | yes | List of processor references to compose |
+| `wiring` | object | yes | Input/output mappings between processors |
+| `parameters` | object | no | Tool parameter schema |
+
+**Implementation contract:**
+
+1. Validate all referenced processors exist in the SemStreams component registry
+2. Build a `reactive.Definition` from the spec
+3. Register the definition with the workflow engine
+4. Register the new flow as a callable tool via `agentictools.RegisterTool()`
+5. Tools are scoped to the agent tree that created them (keyed by root loop ID)
+6. Governance filter chain covers automatically since it sits at the processor boundary
+
+### decompose_task
+
+Returns a DAG of subtasks as structured JSON. The parent agent decides whether to spawn nodes individually or delegate to the DAG execution workflow.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `goal` | string | yes | High-level goal to decompose |
+| `context` | string | no | Additional context for decomposition |
+| `max_depth` | int | no | Maximum decomposition depth |
+
+**Returns:**
+
+```json
+{
+  "dag": {
+    "nodes": [
+      {
+        "id": "node-1",
+        "prompt": "Research current market data",
+        "role": "researcher",
+        "depends_on": []
+      },
+      {
+        "id": "node-2",
+        "prompt": "Analyze findings from research",
+        "role": "analyst",
+        "depends_on": ["node-1"]
+      }
+    ]
+  }
+}
+```
+
+### query_agent_tree
+
+Queries the agent hierarchy via SemStreams' graph query infrastructure. No separate KV bucket — relationships are stored as graph triples alongside loop entities.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `operation` | string | yes | One of: `get_tree`, `get_children`, `get_status` |
+| `loop_id` | string | no | Target loop ID (required for `get_children`, `get_status`) |
+
+**Implementation:** Thin wrapper around graph query client:
+- `get_children` → `GetOutgoingRelationships(ctx, loopEntityID, "agentic.loop.spawned")`
+- `get_tree` → `ExecutePathQuery` with `PredicateFilter: ["agentic.loop.spawned"]`
+- `get_status` → `GetEntity(ctx, loopEntityID)` + read from `AGENT_LOOPS` KV
+
+## Agent Hierarchy via Graph Layer (Option C — Hybrid)
+
+Agent hierarchy uses a hybrid storage model:
+
+- **`AGENT_LOOPS` KV bucket** (existing) — mutable loop state machine, fast KV Watch for SSE delivery of real-time status updates
+- **Graph entity references** — lightweight entities in `ENTITY_STATES` holding relationship triples for parent-child edges, DAG dependencies, and tree structure
+
+This separation respects the KV-or-stream heuristic: `AGENT_LOOPS` needs real-time watch semantics for the hot mutable state path, while the graph layer provides relationship queries that would otherwise require a separate `AGENT_TREE` bucket with manual children-list maintenance.
+
+### Entity ID Mapping
+
+Agent loops map to the 6-part entity ID format:
+
+```
+semsage.default.agentic.orchestrator.loop.<loop-id>
+semsage.default.agentic.orchestrator.task.<task-id>
+```
+
+The `Type` field (`loop`, `task`) enables type-based queries. SemStreams' hierarchy inference auto-creates container entities for the shared `semsage.default.agentic.orchestrator.loop` prefix, enabling group queries.
+
+### Relationship Predicates
+
+| Predicate | From | To | Meaning |
+|-----------|------|----|---------|
+| `agentic.loop.spawned` | parent loop | child loop | Parent spawned child |
+| `agentic.loop.task` | loop | task | Loop executes task |
+| `agentic.task.depends_on` | task | task | DAG dependency edge |
+
+### What This Gives Us for Free
+
+| Need | Graph capability |
+|------|-----------------|
+| "Get all children of loop X" | `GetOutgoingRelationships(ctx, loopID, "agentic.loop.spawned")` |
+| "Get full agent tree" | `ExecutePathQuery` with `MaxDepth` and predicate filter |
+| "Get all active loops" | `ListWithPrefix(ctx, "semsage.default.agentic.orchestrator.loop")` |
+| DAG dependency traversal | `GetOutgoingRelationships(ctx, taskID, "agentic.task.depends_on")` |
+| Sibling discovery | Hierarchy inference auto-creates `.group` container entities |
+| Cross-domain queries | Agent entities queryable alongside domain entities via GraphQL/MCP |
+
+### Graph Operations in spawn_agent
+
+When `spawn_agent` creates a child loop, it also:
+
+1. Creates a lightweight graph entity for the child: `semsage.default.agentic.orchestrator.loop.<childID>`
+2. Creates a relationship triple: `{parent_entity} --agentic.loop.spawned--> {child_entity}`
+
+The existing `AGENT_LOOPS` KV handles the mutable state (iterations, signals, completion). The graph entity holds only identity and relationship triples.
+
+## NATS Resources
+
+No new KV buckets. No new streams. Uses existing infrastructure:
+
+| Resource | Owner | Purpose |
+|----------|-------|---------|
+| `AGENT_LOOPS` | SemStreams | Mutable loop state (existing) |
+| `ENTITY_STATES` | SemStreams | Graph entities including agent hierarchy references (existing) |
+| `AGENT` stream | SemStreams | JetStream subjects `agent.task.*`, `agent.complete.*` (existing) |
+
+## Failure and Cancellation
+
+- **Child failure** — error `ToolResult` returned to parent LLM, which decides: retry, skip, or abort
+- **Timeout** — cascades via Go context propagation
+- **Cancellation** — propagates down the tree via `UserSignal`
+- **Cleanup** — `create_tool` artifacts scoped to agent tree; removed when root loop terminates
+
+## Design Decisions
+
+### Flow Composition Over Code Sandbox
+
+The old spec's `create_tool` with Starlark/WASM is replaced. Instead of a code sandbox, `create_tool` lets the LLM compose existing processors into named flows (reactive definitions) at runtime — wiring existing pieces, not writing new code. This is safer (no arbitrary code execution), leverages the existing governance filter chain, and stays within SemStreams' extension model.
+
+### Subscribe Before Publish
+
+`spawn_agent` subscribes to the completion subject before publishing the task message. This eliminates the race condition where a fast child could complete before the parent starts listening.
+
+### Tool Scoping
+
+Dynamically created tools are scoped to the agent tree that created them, keyed by root loop ID. When the root loop terminates, its tools are cleaned up. This prevents tool namespace pollution across independent agent hierarchies.
+
+## Phasing
+
+### Phase 1 (MVP)
+
+- Graph entity helpers — entity ID mapping, relationship predicates, graph operations
+- `spawn_agent` executor — child agent orchestration + graph relationship creation
+- `create_tool` executor — flow composition
+- `query_agent_tree` executor — hierarchy inspection via graph queries
+- Service composition (`cmd/semsage/main.go`)
+
+### Phase 2
+
+- `decompose_task` executor — DAG generation
+- DAG execution reactive definition — automated DAG execution with dependency ordering
+
+## Project Structure
+
+```
+semsage/
+  go.mod
+  cmd/semsage/main.go
+  agentgraph/                              # Graph entity helpers for agent hierarchy
+    entities.go, entities_test.go          # Entity ID mapping, relationship predicates
+  tools/
+    register.go                            # Tool registration helper
+    spawn/executor.go, executor_test.go
+    create/executor.go, executor_test.go, types.go
+    decompose/executor.go, executor_test.go, types.go
+    tree/executor.go, executor_test.go     # query_agent_tree (wraps graph queries)
+  workflow/dag/                            # Phase 2
+    definition.go, definition_test.go, state.go
+  configs/semsage.yaml
+```

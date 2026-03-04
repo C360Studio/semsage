@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0",
+  "platform": {
+    "org": "semsage",
+    "id": "semsage-dev",
+    "type": "agentic",
+    "region": "local",
+    "instance_id": "semsage-001",
+    "environment": "development"
+  },
+  "nats": {
+    "urls": ["nats://localhost:4222"]
+  },
+  "semsage": {
+    "default_model": "claude-sonnet-4-20250514",
+    "max_spawn_depth": 5
+  }
+}

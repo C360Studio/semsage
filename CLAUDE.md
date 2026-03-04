@@ -16,6 +16,7 @@ SemStreams (available locally at `../semstreams`) provides the core framework:
 |--------------------|--------------------|
 | `component/` — base types, lifecycle, ports, payload registry | Building custom components |
 | `message/` — Graphable interface, Triple, BaseMessage | Domain entity modeling |
+| `graph/` — EntityState, DataManager, query client, hierarchy inference | Agent hierarchy as graph entities with relationship triples |
 | `natsclient/` — NATS connection, KV buckets, JetStream | All NATS communication |
 | `agentic/` — types, state machine, payload registrations | Agentic loop state and payloads |
 | `processor/agentic-*` — loop, model, tools, dispatch | Core agentic processing pipeline |
@@ -24,8 +25,6 @@ SemStreams (available locally at `../semstreams`) provides the core framework:
 When designing new components or message flows, consult SemStreams docs at `../semstreams/docs/`.
 
 ## Build & Test Commands
-
-*To be updated once Go modules are initialized.*
 
 ```bash
 go build ./...
@@ -37,7 +36,7 @@ go vet ./...
 
 ## Architecture
 
-### Core Components
+### SemStreams Components (used by Semsage)
 
 | Component | Role | Input | State |
 |-----------|------|-------|-------|
@@ -45,6 +44,22 @@ go vet ./...
 | `agentic-model` | LLM dispatch | JetStream: `agent.request.*` | — |
 | `agentic-tools` | Tool execution | JetStream: `tool.execute.*` | — |
 | `workflow-processor` | Workflow orchestration | JetStream: `workflow.trigger.*` | KV: `WORKFLOW_EXECUTIONS`, `WORKFLOW_TIMERS` |
+
+### Semsage Tools (registered as ToolExecutors)
+
+| Tool | Role |
+|------|------|
+| `spawn_agent` | Publishes TaskMessage, blocks until child completes, creates graph relationship |
+| `create_tool` | Composes existing processors into named reactive definitions at runtime |
+| `decompose_task` | Returns DAG of subtasks as structured JSON |
+| `query_agent_tree` | Queries agent hierarchy via graph query client |
+
+### Agent Hierarchy — Hybrid Storage Model
+
+- **`AGENT_LOOPS` KV** (SemStreams, existing) — mutable loop state machine, KV Watch for real-time SSE
+- **`ENTITY_STATES` KV** (SemStreams, existing) — lightweight graph entity references with relationship triples (`agentic.loop.spawned`, `agentic.task.depends_on`)
+- Entity IDs for agents: `semsage.default.agentic.orchestrator.loop.<loop-id>`
+- No new KV buckets — hierarchy queries use existing graph infrastructure
 
 ### Key Design Decisions
 
@@ -64,3 +79,5 @@ go vet ./...
 - **Testing**: Table-driven tests, test behavior not implementation, explicit synchronization (no arbitrary sleeps)
 - **Commits**: Conventional commits format `<type>(scope): subject`
 - **Entity IDs**: 6-part hierarchical format `org.platform.domain.system.type.instance`
+- **Configs**: JSON only (not YAML) — follows SemStreams convention. See `configs/semsage.json`
+- **Payloads**: Any payload crossing NATS must use the payload registry (`Schema()`, `MarshalJSON` with type alias, `init()` registration). No ad-hoc structs for wire format.

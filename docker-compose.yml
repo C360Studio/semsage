@@ -1,0 +1,35 @@
+# Semsage Development Environment
+#
+# Starts NATS with JetStream for local development.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: semsage-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command:
+      ["-js", "-sd", "/data", "-m", "8222", "--name", "semsage-nats"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:8222/healthz",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  nats-data:
