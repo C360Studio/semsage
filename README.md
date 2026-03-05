@@ -83,25 +83,43 @@ flowchart TD
 | `decompose_task` | Returns a DAG of subtasks as structured JSON; the parent agent decides whether to spawn nodes individually or hand the DAG to an automated execution workflow |
 | `query_agent_tree` | Queries the agent hierarchy via SemStreams' graph query infrastructure — tree traversal, parent/child relationships, loop state |
 
+## UI Dashboard
+
+A SvelteKit 2 + Svelte 5 dashboard for observing agent hierarchies in real time. It consumes
+the HTTP/SSE API served by the `processor/ui-api` component.
+
+**Routes**
+
+| Route | Purpose |
+|-------|---------|
+| `/activity` | Live activity feed via SSE |
+| `/loops/[id]` | Loop detail and tree view |
+| `/entities` | Entity list |
+| `/entities/[id]` | Entity detail |
+| `/settings` | Configuration |
+| Cmd+K | Chat drawer (inline agent interaction) |
+
+**API endpoints** (served by `processor/ui-api`)
+
+`GET /api/health`, `GET /api/activity` (SSE), `GET /api/loops`, `GET /api/loops/{id}`,
+`POST /api/loops/{id}/signal`, `GET /api/loops/{id}/children`, `GET /api/loops/{id}/tree`,
+`GET /api/trajectory/loops/{id}`, `GET /api/tools`, `POST /api/chat`, `POST /graphql/`
+
 ## Prerequisites
 
 - **Go 1.25+**
+- **Node.js 20+** (for the UI)
 - **NATS Server 2.10+** with JetStream enabled
 - **SemStreams** — available at `../semstreams` or as a Go module dependency
   ([github.com/C360Studio/semstreams](https://github.com/C360Studio/semstreams))
 
 ## Getting Started
 
-**Build**
+**Backend: build and test**
 
 ```bash
 go build ./...
 go vet ./...
-```
-
-**Test**
-
-```bash
 go test ./...
 go test ./... -race
 ```
@@ -111,14 +129,48 @@ go test ./... -race
 Semsage uses JSON configuration files following the SemStreams convention.
 See `configs/semsage.json` for the default configuration.
 
-**Run**
+**Run the backend**
 
 ```bash
 # Start NATS with JetStream via docker compose
 docker compose up -d
 
-# Run Semsage
+# Run Semsage (includes the HTTP/SSE API for the UI)
 go run ./cmd/semsage
+```
+
+**UI: install dependencies**
+
+```bash
+cd ui
+npm install
+```
+
+**Run the UI dev server**
+
+```bash
+# From the ui/ directory
+npm run dev
+```
+
+The dev server proxies API requests to the running backend. The dashboard is available at
+`http://localhost:5173` by default.
+
+**UI: other scripts**
+
+```bash
+npm run build          # Production build (static adapter output)
+npm run check          # svelte-check + TypeScript validation
+npm run test           # Vitest unit tests
+npm run test:e2e       # Playwright e2e tests (43 tests, no backend required)
+npm run test:e2e:ui    # Playwright UI mode for debugging
+```
+
+The Playwright tests use route mocking, so no running backend is needed. On first run, install
+the browser:
+
+```bash
+npx playwright install chromium
 ```
 
 ## Project Structure
@@ -127,12 +179,24 @@ go run ./cmd/semsage
 semsage/
 ├── cmd/semsage/              # Service entry point
 ├── agentgraph/               # Graph entity helpers for agent hierarchy
+├── processor/
+│   └── ui-api/               # HTTP + SSE component serving the dashboard API
+│       ├── component.go      # SemStreams processor registration
+│       ├── config.go         # Configuration
+│       ├── http.go           # Route handlers
+│       ├── http_test.go      # 22 unit tests (race-detector clean)
+│       ├── sse.go            # Server-sent events
+│       └── types.go          # Shared types
 ├── tools/
 │   ├── register.go           # Tool registration helper
 │   ├── spawn/                # spawn_agent executor
 │   ├── create/               # create_tool executor
 │   ├── decompose/            # decompose_task executor
 │   └── tree/                 # query_agent_tree executor (graph-backed)
+├── ui/                       # SvelteKit 2 + Svelte 5 dashboard
+│   ├── src/routes/           # App routes (activity, loops, entities, settings)
+│   ├── e2e/                  # Playwright e2e tests (43 tests across 6 files)
+│   └── package.json
 ├── workflow/dag/             # DAG execution reactive definition
 ├── configs/                  # Default configuration
 └── docs/                     # Architectural documentation
