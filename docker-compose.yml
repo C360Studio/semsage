@@ -1,10 +1,9 @@
 # Semsage Development Environment
 #
-# Starts NATS with JetStream for local development.
-#
 # Usage:
-#   docker compose up -d
-#   docker compose down
+#   docker compose up -d      # Start all services
+#   docker compose down        # Stop all services
+#   docker compose up nats -d  # Start NATS only (for local dev)
 
 services:
   nats:
@@ -30,6 +29,28 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  semsage:
+    build: .
+    container_name: semsage-api
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: nats://nats:4222
+    expose:
+      - "8090"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: semsage-caddy
+    depends_on:
+      - semsage
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./ui/build:/srv/ui:ro
 
 volumes:
   nats-data:

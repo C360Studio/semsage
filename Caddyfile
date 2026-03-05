@@ -1,0 +1,15 @@
+:8080
+
+handle /api/* {
+	reverse_proxy semsage:8090
+}
+
+handle /graphql/* {
+	reverse_proxy semsage:8090
+}
+
+handle {
+	root * /srv/ui
+	try_files {path} /index.html
+	file_server
+}

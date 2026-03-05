@@ -11,8 +11,21 @@
   "nats": {
     "urls": ["nats://localhost:4222"]
   },
-  "semsage": {
-    "default_model": "claude-sonnet-4-20250514",
-    "max_spawn_depth": 5
+  "services": {
+    "service-manager": {
+      "enabled": true,
+      "config": {
+        "http_port": 8090,
+        "swagger_ui": true,
+        "server_info": {
+          "title": "Semsage API",
+          "version": "0.1.0"
+        }
+      }
+    },
+    "ui-api": {
+      "enabled": true,
+      "config": {}
+    }
   }
 }
